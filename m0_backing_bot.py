@@ -44,7 +44,6 @@ import sys
 import json
 import time
 import html
-import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -52,10 +51,14 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().with_name(".env"))
+from logger_utils import (
+    SigtermReceived, emit_logging_initialization_failure, install_sigterm_handler,
+    logger as log, resolve_script_owner, restore_sigterm_handler, setup_logger,
+    shutdown_logger,
+)
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")  # journald adds timestamps
-log = logging.getLogger("m0bot")
+REPOSITORY = SERVICE_NAME = "m0bot"
+RUNTIME = "backing_bot"
 
 
 def _rpc_url() -> str:
@@ -77,7 +80,6 @@ def _state_file() -> str:
     return os.path.expanduser("~/.m0bot_state.json")
 
 
-RPC_URL = _rpc_url()
 MINTER_GATEWAY = "0xf7f9638cb444D65e5A40bF5ff98ebE4ff319F04E"
 EXPLORER = "https://etherscan.io/address/"
 DECIMALS = 6  # $M and collateral values are 6-decimal integers
@@ -110,27 +112,42 @@ KNOWN_MINTERS = [
     "0x6768cda9f017c82074ea9f646621d80da8ff5f7f",
 ]
 
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-STATE_FILE = _state_file()
-ALERT_RATIO = float(os.environ.get("ALERT_RATIO", "1.00"))
-EXPIRY_WARN_HOURS = float(os.environ.get("EXPIRY_WARN_HOURS", "6"))
-REPORT_TZ = ZoneInfo(os.environ.get("REPORT_TZ", "Europe/Prague"))
-REPORT_HOURS = {int(h) % 24 for h in os.environ.get("REPORT_HOURS", "8,16,24").split(",")}
-CHECK_MINUTES = int(os.environ.get("CHECK_MINUTES", "60"))
-LABELS = {
-    "0x7f7489582b64abe46c074a45d758d701c2ca5446": "MXON",
-    "0xcd1394d24e1e404f9eb3609f872b0736becb9d74": "Bridge",
-    "0x5d238f4eac94da0a635ee39fa389a4754395d5d9": "MoonPay",
-    "0x1d5b695d13f231a605d231631c688fb33477b249": "1Money",
-    **{
-        k.strip().lower(): v.strip()
-        for k, v in (p.split("=", 1) for p in os.environ.get("MINTER_LABELS", "").split(",") if "=" in p)
-    },
-}
-MINTERS = list(dict.fromkeys(
-    KNOWN_MINTERS + [a.strip().lower() for a in os.environ.get("EXTRA_MINTERS", "").split(",") if a.strip()]
-))
+def configure():
+    global RPC_URL, TG_BOT_TOKEN, TG_CHAT_ID, STATE_FILE, ALERT_RATIO, EXPIRY_WARN_HOURS
+    global REPORT_TZ, REPORT_HOURS, CHECK_MINUTES, LABELS, MINTERS
+
+    RPC_URL = _rpc_url()
+    TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+    TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+    STATE_FILE = _state_file()
+    ALERT_RATIO = float(os.environ.get("ALERT_RATIO", "1.00"))
+    EXPIRY_WARN_HOURS = float(os.environ.get("EXPIRY_WARN_HOURS", "6"))
+    REPORT_TZ = ZoneInfo(os.environ.get("REPORT_TZ", "Europe/Prague"))
+    REPORT_HOURS = {int(h) % 24 for h in os.environ.get("REPORT_HOURS", "8,16,24").split(",")}
+    CHECK_MINUTES = int(os.environ.get("CHECK_MINUTES", "60"))
+    LABELS = {
+        "0x7f7489582b64abe46c074a45d758d701c2ca5446": "MXON",
+        "0xcd1394d24e1e404f9eb3609f872b0736becb9d74": "Bridge",
+        "0x5d238f4eac94da0a635ee39fa389a4754395d5d9": "MoonPay",
+        "0x1d5b695d13f231a605d231631c688fb33477b249": "1Money",
+        **{
+            k.strip().lower(): v.strip()
+            for k, v in (p.split("=", 1) for p in os.environ.get("MINTER_LABELS", "").split(",") if "=" in p)
+        },
+    }
+    MINTERS = list(dict.fromkeys(
+        KNOWN_MINTERS + [a.strip().lower() for a in os.environ.get("EXTRA_MINTERS", "").split(",") if a.strip()]
+    ))
+
+
+def log_failure(event, message, error, *, level="WARNING"):
+    # HTTP exceptions can contain Telegram or RPC credentials in their URLs.
+    context = log.bind(event=event, error_type=type(error).__name__)
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        status = error.response.status_code
+        context = context.bind(http_status=status)
+        message = f"{message} (HTTP {status})"
+    context.log(level, message)
 
 
 # ----------------------------------------------------------------- rpc ----
@@ -177,7 +194,7 @@ def discover_all_minters():
             "topics": [TOPIC_MINTER_ACTIVATED],
         }])
     except Exception as e:
-        log.warning("full minter scan unavailable, using known list: %s", e)
+        log_failure("minter_discovery_failed", "Full minter scan unavailable, using known list", e)
         return
     for a in dict.fromkeys("0x" + log["topics"][1][-40:].lower() for log in logs):
         if a not in MINTERS:
@@ -371,7 +388,7 @@ def save_state(state: dict):
             json.dump(state, f)
         os.replace(tmp, STATE_FILE)
     except OSError as e:
-        log.warning("could not save state to %s: %s", STATE_FILE, e)
+        log_failure("state_save_failed", "Could not save bot state", e)
 
 
 # -------------------------------------------------------------- telegram --
@@ -409,7 +426,8 @@ def handle(update: dict):
         elif cmd == "/minters":
             send(chat_id, minters_detail(parse(fetch())))
     except Exception as e:  # keep the bot alive on RPC hiccups
-        send(chat_id, f"Error reading M0 on-chain data: {html.escape(str(e))[:500]}")
+        log_failure("telegram_command_failed", "Could not respond to Telegram command", e)
+        send(chat_id, "Error reading M0 on-chain data. Check the bot logs for details.")
 
 
 def run_forever():
@@ -426,10 +444,12 @@ def run_forever():
         save_state({"last_report": last_report, "alerts": sorted(last_alert),
                     "last_scanned": last_scanned, "minters": MINTERS})
 
-    log.info("Bot running (%d minters, state %s). Send /start to it in Telegram to get a chat id.",
-             len(MINTERS), STATE_FILE)
+    log.bind(event="bot_ready", minter_count=len(MINTERS)).info(
+        "Bot running ({} minters). Send /start to it in Telegram to get a chat id.", len(MINTERS)
+    )
     if not TG_CHAT_ID:
-        log.warning("TG_CHAT_ID not set: answering commands only, no scheduled posts or alerts")
+        log.bind(event="reports_disabled").info("TG_CHAT_ID not set, answering commands only")
+    last_heartbeat = time.monotonic()
     while True:
         try:
             res = tg("getUpdates", offset=offset, timeout=30)
@@ -437,10 +457,14 @@ def run_forever():
                 offset = u["update_id"] + 1
                 handle(u)
         except Exception as e:
-            log.warning("telegram poll error: %s", e)
+            log_failure("telegram_poll_failed", "Telegram poll failed", e)
             time.sleep(5)
 
         if not TG_CHAT_ID:
+            now = time.monotonic()
+            if now - last_heartbeat >= 3600:
+                log.bind(event="process_heartbeat").info("Bot is running in commands-only mode")
+                last_heartbeat = now
             continue
 
         # scheduled report: checked every poll (~30 s) so a slot is never skipped
@@ -452,7 +476,7 @@ def run_forever():
                 last_report = slot
                 save()
             except Exception as e:
-                log.warning("report error: %s", e)
+                log_failure("report_failed", "Scheduled report failed", e, level="ERROR")
 
         if time.time() - last_check < CHECK_MINUTES * 60:
             continue
@@ -468,33 +492,86 @@ def run_forever():
                 send(TG_CHAT_ID, f'🆕 New M0 minter activated: <a href="{EXPLORER}{a}">{short(a)}</a>')
             last_scanned = head
         except Exception as e:
-            log.warning("minter scan error: %s", e)
+            log_failure("minter_scan_failed", "Incremental minter scan failed", e)
 
         try:
             current = alerts(parse(fetch()))
             for key in current.keys() - last_alert:  # only send new alerts, not repeats
                 send(TG_CHAT_ID, current[key])
             last_alert = set(current)
+            log.bind(event="backing_check_completed", minter_count=len(MINTERS),
+                     alert_count=len(current)).info("Backing check completed")
         except Exception as e:
-            log.warning("alert check error: %s", e)
+            log_failure("backing_check_failed", "Backing alert check failed", e, level="ERROR")
         save()
 
 
-if __name__ == "__main__":
-    if "--print" not in sys.argv and not TG_BOT_TOKEN:
-        sys.exit("Set TG_BOT_TOKEN (create a bot with @BotFather)")
-    if "--once" in sys.argv and not TG_CHAT_ID:
-        sys.exit("Set TG_CHAT_ID")
+def run(print_only, once):
     discover_all_minters()
-    if "--print" in sys.argv:
+    if print_only:
         d = parse(fetch())
         print(summary(d))
         print()
         print("\n".join(alerts(d).values()))
-    elif "--once" in sys.argv:
+    elif once:
         d = parse(fetch())
         send(TG_CHAT_ID, summary(d))
         for a in alerts(d).values():
             send(TG_CHAT_ID, a)
     else:
         run_forever()
+
+
+def main() -> int:
+    load_dotenv(Path(__file__).resolve().with_name(".env"))
+    level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    try:
+        owner = resolve_script_owner()
+        log.level(level)
+    except ValueError as error:
+        emit_logging_initialization_failure(
+            repository=REPOSITORY, service_name=SERVICE_NAME, runtime=RUNTIME,
+            log_level=level, error=error,
+        )
+        return 2
+    try:
+        setup_logger(
+            RUNTIME, level, repository=REPOSITORY, service_name=SERVICE_NAME,
+            script_owner=owner, console_stream=sys.stderr,
+        )
+    except Exception:
+        return 2
+
+    previous = install_sigterm_handler()
+    print_only, once = "--print" in sys.argv, "--once" in sys.argv
+    try:
+        mode = "print" if print_only else "once" if once else "continuous"
+        log.bind(event="process_started", bot_mode=mode).info("M0 backing bot started")
+        try:
+            configure()
+        except (ValueError, KeyError) as error:
+            log_failure("configuration_invalid", "Invalid bot configuration", error, level="ERROR")
+            return 2
+        if not print_only and not TG_BOT_TOKEN:
+            log.bind(event="configuration_invalid", setting="TG_BOT_TOKEN").error("Set TG_BOT_TOKEN")
+            return 2
+        if once and not TG_CHAT_ID:
+            log.bind(event="configuration_invalid", setting="TG_CHAT_ID").error("Set TG_CHAT_ID")
+            return 2
+        run(print_only, once)
+    except SigtermReceived:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        log_failure("process_crashed", "M0 backing bot failed", error, level="ERROR")
+        return 1
+    finally:
+        log.bind(event="process_stopping").info("M0 backing bot stopping")
+        shutdown_logger()
+        restore_sigterm_handler(previous)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

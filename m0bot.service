@@ -16,7 +16,10 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-Environment=PYTHONUNBUFFERED=1
+Environment=LOG_MODE=journal LOG_INSTANCE=main
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=m0bot.backing_bot.main
 
 [Install]
 WantedBy=multi-user.target
