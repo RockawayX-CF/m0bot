@@ -14,8 +14,8 @@ reported on-chain, and:
 Note: "collateral" is the value each minter reports on-chain (signed by M0
 validators). The real-world reserves (T-bills/cash) are off-chain.
 
-Configuration comes from environment variables (see m0bot.env.example; under
-systemd they are loaded with EnvironmentFile=).
+Configuration comes from .env next to this script (see .env.example).
+Environment variables, including those set by systemd, take precedence.
 
 Env vars (required):  TG_BOT_TOKEN
                       TG_CHAT_ID         chat/channel for scheduled posts + alerts
@@ -35,9 +35,9 @@ Env vars (optional):  RPC_URL            default: contents of ~/.m0bot_rpc,
                                          $STATE_DIRECTORY/m0bot_state.json (set by
                                          systemd StateDirectory=), else ~/.m0bot_state.json
 
-Run continuously:  python m0_backing_bot.py
-One-shot (cron):   python m0_backing_bot.py --once     (sends summary to TG_CHAT_ID)
-Print only:        python m0_backing_bot.py --print
+Run continuously:  python3 m0_backing_bot.py
+One-shot (cron):   python3 m0_backing_bot.py --once     (sends summary to TG_CHAT_ID)
+Print only:        python3 m0_backing_bot.py --print
 """
 import os
 import sys
@@ -46,9 +46,13 @@ import time
 import html
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")  # journald adds timestamps
 log = logging.getLogger("m0bot")
