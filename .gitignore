@@ -1,0 +1,8 @@
+# secrets and runtime files
+*.env
+!*.env.example
+state.json
+*_state.json
+*.log
+venv/
+__pycache__/

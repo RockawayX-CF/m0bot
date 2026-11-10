@@ -1,0 +1,22 @@
+[Unit]
+Description=M0 backing monitor (Telegram bot)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/m0bot.env
+ExecStart=/opt/m0bot/venv/bin/python /opt/m0bot/m0_backing_bot.py
+Restart=always
+RestartSec=30
+# throwaway unprivileged user; state persists in /var/lib/m0bot
+DynamicUser=yes
+StateDirectory=m0bot
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
